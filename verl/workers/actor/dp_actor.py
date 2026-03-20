@@ -361,9 +361,13 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
                     if use_topk:
+                        # Use log_softmax (single fused backward) instead of
+                        # separate topk + logsumexp (dual backward references)
+                        # to avoid SplitWithSizesBackward0 under FSDP.
+                        log_probs_rmpad = torch.log_softmax(logits_rmpad, dim=-1)
                         if topk_indices is None:
                             topk = min(distill_topk, logits_rmpad.shape[-1])
-                            topk_logits_rmpad, topk_indices_rmpad = torch.topk(logits_rmpad, topk, dim=-1)
+                            topk_logps_rmpad, topk_indices_rmpad = torch.topk(log_probs_rmpad, topk, dim=-1)
                         else:
                             topk = topk_indices.size(-1)
                             full_topk_indices = torch.zeros(
@@ -381,9 +385,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 topk_indices_rmpad = slice_input_tensor(
                                     topk_indices_rmpad.unsqueeze(0), dim=1, padding=True
                                 ).squeeze(0)
-                            topk_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=topk_indices_rmpad)
-                        logsumexp_rmpad = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
-                        topk_logps_rmpad = topk_logits_rmpad - logsumexp_rmpad
+                            topk_logps_rmpad = torch.gather(log_probs_rmpad, dim=-1, index=topk_indices_rmpad)
 
                     # Compute sum_pi_squared if requested (for optimal_token_baseline)
                     if calculate_sum_pi_squared:
@@ -526,13 +528,15 @@ class DataParallelPPOActor(BasePPOActor):
                     if compute_all_logps:
                         all_logps = torch.log_softmax(logits, dim=-1)
                     if use_topk:
+                        # Use log_softmax (single fused backward) instead of
+                        # separate topk + logsumexp (dual backward references)
+                        # to avoid SplitWithSizesBackward0 under FSDP.
+                        topk_log_probs = torch.log_softmax(logits, dim=-1)
                         if topk_indices is None:
                             topk = min(distill_topk, logits.size(-1))
-                            topk_logits, topk_indices = torch.topk(logits, topk, dim=-1)
+                            topk_logps, topk_indices = torch.topk(topk_log_probs, topk, dim=-1)
                         else:
-                            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
-                        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
-                        topk_logps = topk_logits - logsumexp
+                            topk_logps = torch.gather(topk_log_probs, dim=-1, index=topk_indices)
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
